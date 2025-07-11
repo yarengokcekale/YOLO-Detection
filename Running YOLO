@@ -1,0 +1,157 @@
+from ultralytics import YOLO
+import cv2
+import numpy as np
+
+model = YOLO('../Yolo-Weights/yolov8l.pt')
+
+
+# Yöntem 1: OpenCV ile manuel boyut ayarlama (Eski YOLO versiyonu için)
+def show_resized_image(image_path, max_width=800, max_height=600):
+    # YOLO tahminini yap
+    results = model(image_path)
+
+    # Orijinal görüntüyü yükle
+    original_img = cv2.imread(image_path)
+
+    # Sonuçları manuel olarak çiz
+    annotated_img = draw_boxes(original_img, results[0])
+
+    # Görüntü boyutlarını al
+    height, width = annotated_img.shape[:2]
+
+    # Oranı koru ve boyutu ayarla
+    if width > max_width or height > max_height:
+        # Hangi boyutun daha büyük olduğunu belirle
+        ratio = min(max_width / width, max_height / height)
+        new_width = int(width * ratio)
+        new_height = int(height * ratio)
+
+        # Yeniden boyutlandır
+        annotated_img = cv2.resize(annotated_img, (new_width, new_height))
+
+    # Göster
+    cv2.imshow('YOLO Detection', annotated_img)
+    cv2.waitKey(0)
+    cv2.destroyAllWindows()
+
+
+# Manuel olarak bounding box çizme fonksiyonu
+def draw_boxes(image, results):
+    # Görüntüyü kopyala
+    annotated_img = image.copy()
+
+    # Eğer results içinde boxes varsa
+    if hasattr(results, 'boxes') and results.boxes is not None:
+        boxes = results.boxes
+
+        # Her bir detection için
+        for i in range(len(boxes)):
+            # Bounding box koordinatları
+            x1, y1, x2, y2 = boxes.xyxy[i].int().tolist()
+
+            # Güven skoru
+            confidence = boxes.conf[i].item()
+
+            # Sınıf ID ve ismi
+            class_id = int(boxes.cls[i].item())
+            class_name = model.names[class_id]
+
+            # Bounding box çiz
+            cv2.rectangle(annotated_img, (x1, y1), (x2, y2), (0, 255, 0), 2)
+
+            # Label hazırla
+            label = f"{class_name}: {confidence:.2f}"
+
+            # Label'ı çiz
+            label_size = cv2.getTextSize(label, cv2.FONT_HERSHEY_SIMPLEX, 0.5, 2)[0]
+            cv2.rectangle(annotated_img, (x1, y1 - label_size[1] - 10),
+                          (x1 + label_size[0], y1), (0, 255, 0), -1)
+            cv2.putText(annotated_img, label, (x1, y1 - 5),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 0, 0), 2)
+
+    return annotated_img
+
+
+# Yöntem 2: imgsz parametresi ile model seviyesinde boyut ayarlama
+def show_with_model_resize(image_path, img_size=640):
+    # Model tahminini belirli boyutta yap
+    results = model(image_path, imgsz=img_size, show=False)
+
+    # Orijinal görüntüyü yükle
+    original_img = cv2.imread(image_path)
+
+    # Sonuçları manuel olarak çiz
+    annotated_img = draw_boxes(original_img, results[0])
+
+    # Pencere boyutunu ayarla
+    cv2.namedWindow('YOLO Detection', cv2.WINDOW_NORMAL)
+    cv2.resizeWindow('YOLO Detection', 800, 600)
+
+    # Göster
+    cv2.imshow('YOLO Detection', annotated_img)
+    cv2.waitKey(0)
+    cv2.destroyAllWindows()
+
+
+# Yöntem 3: Pencere boyutunu ayarla (en basit)
+def show_with_window_resize(image_path):
+    results = model(image_path, show=False)
+
+    # Orijinal görüntüyü yükle
+    original_img = cv2.imread(image_path)
+
+    # Sonuçları manuel olarak çiz
+    annotated_img = draw_boxes(original_img, results[0])
+
+    # Pencereyi yeniden boyutlandırılabilir yap
+    cv2.namedWindow('YOLO Detection', cv2.WINDOW_NORMAL)
+    cv2.resizeWindow('YOLO Detection', 1000, 700)  # İstediğiniz boyut
+
+    cv2.imshow('YOLO Detection', annotated_img)
+    cv2.waitKey(0)
+    cv2.destroyAllWindows()
+
+
+# Kullanım örnekleri:
+image_paths = [
+    r"C:\Users\yaren\AppData\Local\Temp\4deadb96-be49-4ab8-b3e2-8e620774dfff_Images.zip.fff\Images\1.yolo.png.png",
+    r"C:\Users\yaren\AppData\Local\Temp\eb8f476c-bad3-4e9d-8632-476536fea20c_Images.zip.20c\Images\2.yolo.png.png",
+    r"C:\Users\yaren\AppData\Local\Temp\3303b9ea-abfd-4799-a0e1-cb8b6bb80951_Images.zip.951\Images\3.yolo.png.png"
+]
+
+# Yöntem 1'i kullanarak
+print("Yöntem 1: Manuel boyut ayarlama")
+for i, path in enumerate(image_paths, 1):
+    print(f"Resim {i} gösteriliyor...")
+    show_resized_image(path, max_width=900, max_height=700)
+
+# Yöntem 2'yi kullanarak
+print("\nYöntem 2: Model seviyesinde boyut ayarlama")
+for i, path in enumerate(image_paths, 1):
+    print(f"Resim {i} gösteriliyor...")
+    show_with_model_resize(path, img_size=800)
+
+# Yöntem 3'ü kullanarak (en basit)
+print("\nYöntem 3: Pencere boyutu ayarlama")
+for i, path in enumerate(image_paths, 1):
+    print(f"Resim {i} gösteriliyor...")
+    show_with_window_resize(path)
+
+
+# Bonus: Tüm görselleri aynı anda göster
+def show_all_images():
+    for i, path in enumerate(image_paths, 1):
+        results = model(path, show=False)
+        annotated_img = results[0].plot()
+
+        # Her görsel için farklı pencere
+        window_name = f'YOLO Detection - Image {i}'
+        cv2.namedWindow(window_name, cv2.WINDOW_NORMAL)
+        cv2.resizeWindow(window_name, 600, 400)
+        cv2.imshow(window_name, annotated_img)
+
+    print("Tüm pencereler açıldı. Bir tuşa basın...")
+    cv2.waitKey(0)
+    cv2.destroyAllWindows()
+
+# show_all_images()  # Bu satırı aktif ederseniz tüm görseller aynı anda açılır
