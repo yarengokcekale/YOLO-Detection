@@ -1,0 +1,4 @@
+train: C:/Users/yaren/OneDrive/Masaüstü/drone_dataset/train/images
+val: C:/Users/yaren/OneDrive/Masaüstü/drone_dataset/valid/images
+nc: 1
+names: ['drone']
