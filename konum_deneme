@@ -563,26 +563,17 @@ class DroneDetectionClient:  #programın istemci(client) tarafını temsil eden 
         
         for detection in self.current_data.get("detections", []):
             pos = detection.get("position", {})
-            # Convert normalized coordinates (0.0-1.0) to the new -1.0 to 1.0 system
-            # Assuming map_x and map_y from server are 0.0-1.0
-            # Convert 0.0-1.0 to -1.0 to 1.0 range: (val * 2) - 1
-            normalized_x_new_system = (pos.get("map_x", 0.5) * 2) - 1
-            normalized_y_new_system = (pos.get("map_y", 0.5) * 2) - 1
+            normalized_x_new_system = pos.get("map_x", 0.5) * width
+            normalized_y_new_system = pos.get("map_y", 0.5) * height
 
-            # Convert -1.0 to 1.0 coordinates to canvas pixels
-            # X: -1.0 is left edge, 1.0 is right edge
-            # Y: -1.0 is bottom edge, 1.0 is top edge (Tkinter Y is inverted)
             map_x_pixel = center_x + (normalized_x_new_system * (width / 2))
             map_y_pixel = center_y - (normalized_y_new_system * (height / 2)) # Invert Y for Tkinter
             
             drone_id = detection.get("id", "?")
-            # Draw drone as a circle
             self.map_canvas.create_oval(map_x_pixel-6, map_y_pixel-6, map_x_pixel+6, map_y_pixel+6,
                                          fill="#ff0000", outline="#ffffff", width=2, tags="drone")
-            # Write Drone ID
             self.map_canvas.create_text(map_x_pixel, map_y_pixel, text=str(drone_id), 
                                          fill="#ffffff", font=("Arial", 8, "bold"), tags="drone")
-            # Draw dashed line from center to drone
             self.map_canvas.create_line(center_x, center_y, map_x_pixel, map_y_pixel, 
                                          fill="#00ff00", width=1, dash=(5, 5), tags="drone")
             #sunucudan gelen 0-1 aralığındaki değerler (-1)-1 arasına dönüştürülür
@@ -755,9 +746,9 @@ class DroneDetectionClient:  #programın istemci(client) tarafını temsil eden 
         
         for detection in self.current_data.get("detections", []):
             pos = detection.get("position", {})
-            # Convert 0.0-1.0 to -1.0 to 1.0 range for display
+      
             display_x = (pos.get("map_x", 0.5) * 2) - 1
-            display_y = (pos.get("map_y", 0.5) * 2) - 1 # Y-axis inverted for display (positive up)
+            display_y = (pos.get("map_y", 0.5) * 2) + 1 # Y-axis inverted for display (positive up)
 
             values = (
                 f"D{detection.get('id', '-')}",
@@ -780,7 +771,7 @@ class DroneDetectionClient:  #programın istemci(client) tarafını temsil eden 
         for entry in sorted_history:
             # Convert 0.0-1.0 to -1.0 to 1.0 range for display
             display_x = (entry.get("map_x", 0.5) * 2) - 1
-            display_y = (entry.get("map_y", 0.5) * 2) - 1 # Y-axis inverted for display (positive up)
+            display_y = (entry.get("map_y", 0.5) * 2) + 1 # Y-axis inverted for display (positive up)
 
             values = (
                 entry.get("timestamp", "--"),
