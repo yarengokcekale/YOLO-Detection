@@ -1,0 +1,986 @@
+import socket
+import tkinter as tk
+from tkinter import ttk, messagebox, Canvas
+import json
+import threading
+from datetime import datetime
+import collections
+import os
+
+class DroneDetectionClient:
+    def __init__(self):
+        # Default IP and Port values
+        self.default_server_host = '127.0.0.1'
+        self.default_server_port = 8888
+
+        self.socket = None
+        self.connected = False
+        self.running = True
+        
+        # Kullanıcı verilerini JSON'dan yükle
+        self.users = self.load_users_from_json()
+        
+        # Login credentials
+        self.login_attempts = 0
+        self.max_attempts = 3
+        self.logged_in = False
+        self.current_user = None
+        
+        # Drone verileri için güncel durum
+        self.current_data = {
+            "drone_count": 0,
+            "threat_level": "YOK",
+            "detections": [],
+            "timestamp": "",
+            "fire_authorized": False
+        }
+        
+        # Geçmiş tespitler için deque
+        self.detection_history = collections.deque(maxlen=1000)
+        
+        self.setup_login_ui()
+        
+    def load_users_from_json(self):
+        """JSON dosyasından kullanıcı bilgilerini yükler"""
+        json_path = r"C:\Users\yaren\OneDrive\Masaüstü\drone_dataset\kullanici_bilgileri.json"
+        users = {}
+        
+        try:
+            with open(json_path, 'r', encoding='utf-8') as f:
+                user_list = json.load(f)
+                
+            for user in user_list:
+                username = user.get("kullanici_adi")
+                password = user.get("kullanici_sifre")
+                role = user.get("kullanici_yetkisi")
+                
+                if username and password:
+                    users[username] = {
+                        "password": password,
+                        "name": username,
+                        "role": role
+                    }
+            
+            print(f"{len(users)} kullanıcı başarıyla yüklendi")
+            return users
+            
+        except FileNotFoundError:
+            print(f"Hata: {json_path} dosyası bulunamadı")
+            return {}
+        except json.JSONDecodeError:
+            print(f"Hata: {json_path} geçersiz JSON formatı")
+            return {}
+        except Exception as e:
+            print(f"Beklenmeyen hata: {str(e)}")
+            return {}
+    
+    def setup_login_ui(self):
+        """Giriş ekranı arayüzünü kurar"""
+        self.window = tk.Tk()
+        self.window.title("Drone Tespit Sistemi - Giriş")
+        self.window.geometry("500x400")
+        self.window.configure(bg="#1a1a1a")
+
+        # Pencereyi ortala
+        self.window.geometry("+{}+{}".format(
+            (self.window.winfo_screenwidth() // 2) - 250,
+            (self.window.winfo_screenheight() // 2) - 200
+        ))
+        
+        # Login frame
+        self.login_frame = tk.Frame(self.window, bg="#1a1a1a")
+        self.login_frame.pack(fill=tk.BOTH, expand=True)
+        
+        # Başlık
+        title_label = tk.Label(self.login_frame,
+                              text="🛡️ DRONE TESPİT SİSTEMİ",
+                              font=("Arial", 20, "bold"),
+                              bg="#1a1a1a", fg="#00ff00")
+        title_label.pack(pady=30)
+        
+        subtitle_label = tk.Label(self.login_frame,
+                                 text="SİSTEM GİRİŞİ",
+                                 font=("Arial", 14, "bold"),
+                                 bg="#1a1a1a", fg="#ffffff")
+        subtitle_label.pack(pady=10)
+        
+        # Login container
+        login_container = tk.Frame(self.login_frame, bg="#2c2c2c", relief=tk.RAISED, bd=2)
+        login_container.pack(pady=20, padx=50, fill=tk.X)
+        
+        # Kullanıcı adı
+        username_label = tk.Label(login_container,
+                                 text="Kullanıcı Adı:",
+                                 font=("Arial", 12, "bold"),
+                                 bg="#2c2c2c", fg="#ffffff")
+        username_label.pack(pady=(20, 5))
+        
+        self.username_entry = tk.Entry(login_container,
+                                      font=("Arial", 12),
+                                      bg="#3a3a3a", fg="#ffffff",
+                                      insertbackground="#ffffff",
+                                      justify=tk.CENTER,
+                                      width=20)
+        self.username_entry.pack(pady=5)
+        
+        # Şifre
+        password_label = tk.Label(login_container,
+                                 text="Şifre:",
+                                 font=("Arial", 12, "bold"),
+                                 bg="#2c2c2c", fg="#ffffff")
+        password_label.pack(pady=(15, 5))
+        
+        self.password_entry = tk.Entry(login_container,
+                                      font=("Arial", 12),
+                                      bg="#3a3a3a", fg="#ffffff",
+                                      insertbackground="#ffffff",
+                                      justify=tk.CENTER,
+                                      width=20,
+                                      show="*")
+        self.password_entry.pack(pady=5)
+        
+        # Giriş butonu
+        self.login_button = tk.Button(login_container,
+                                     text="🔐 GİRİŞ YAP",
+                                     font=("Arial", 12, "bold"),
+                                     bg="#008000", fg="#ffffff",
+                                     command=self.attempt_login,
+                                     width=15,
+                                     height=2)
+        self.login_button.pack(pady=20)
+        
+        # Durum etiketi
+        self.login_status = tk.Label(login_container,
+                                    text="",
+                                    font=("Arial", 10),
+                                    bg="#2c2c2c", fg="#ffff00")
+        self.login_status.pack(pady=5)
+        
+        # Deneme sayacı
+        self.attempt_label = tk.Label(login_container,
+                                     text=f"Kalan deneme hakkı: {self.max_attempts - self.login_attempts}",
+                                     font=("Arial", 9),
+                                     bg="#2c2c2c", fg="#cccccc")
+        self.attempt_label.pack(pady=(5, 20))
+        
+        # Enter tuşu ile giriş
+        self.username_entry.bind('<Return>', lambda event: self.attempt_login())
+        self.password_entry.bind('<Return>', lambda event: self.attempt_login())
+        
+        # İmleci kullanıcı adı alanına focus et
+        self.username_entry.focus()
+        
+        # Pencere kapatma protokolü
+        self.window.protocol("WM_DELETE_WINDOW", self.on_closing)
+    
+    def attempt_login(self):
+        """Giriş denemesi yapar"""
+        username = self.username_entry.get().strip()
+        password = self.password_entry.get().strip()
+        
+        if not username or not password:
+            self.login_status.config(text="❌ Kullanıcı adı ve şifre gerekli!", fg="#ff0000")
+            return
+        
+        # JSON'dan yüklenen kullanıcılarla kontrol et
+        if username in self.users and self.users[username]["password"] == password:
+            # Başarılı giriş
+            self.logged_in = True
+            self.current_user = {
+                "username": username,
+                "name": self.users[username]["name"],
+                "role": self.users[username]["role"]
+            }
+            self.login_status.config(text="✅ Giriş başarılı! Sistem açılıyor...", fg="#00ff00")
+            self.window.after(1000, self.show_main_system)
+        else:
+            # Başarısız giriş
+            self.login_attempts += 1
+            remaining_attempts = self.max_attempts - self.login_attempts
+            
+            if remaining_attempts > 0:
+                self.login_status.config(text=f"❌ Hatalı kullanıcı adı veya şifre!", fg="#ff0000")
+                self.attempt_label.config(text=f"Kalan deneme hakkı: {remaining_attempts}")
+                self.password_entry.delete(0, tk.END)
+                self.password_entry.focus()
+            else:
+                self.login_status.config(text="🚫 Maksimum deneme sayısına ulaşıldı!", fg="#ff0000")
+                self.attempt_label.config(text="Sistem kapatılıyor...", fg="#ff0000")
+                self.login_button.config(state=tk.DISABLED, bg="#666666")
+                self.username_entry.config(state=tk.DISABLED)
+                self.password_entry.config(state=tk.DISABLED)
+                self.window.after(2000, self.on_closing)
+    
+    def show_main_system(self):
+        """Ana sistem ekranını gösterir"""
+        self.login_frame.destroy()
+        
+        # Pencereyi yeniden boyutlandır ve ortala
+        self.window.title("Drone Tespit Sistemi")
+        self.window.geometry("1400x800")
+        self.window.geometry("+{}+{}".format(
+            (self.window.winfo_screenwidth() // 2) - 700,
+            (self.window.winfo_screenheight() // 2) - 400
+        ))
+        
+        self.setup_main_ui()
+        
+    def setup_main_ui(self):
+        """Ana sistem arayüzünü kurar"""
+        # Ana container
+        main_container = tk.Frame(self.window, bg="#1a1a1a")
+        main_container.pack(fill=tk.BOTH, expand=True, padx=10, pady=10)
+
+        # --- Üst Navigasyon ve Başlık Frame ---
+        header_frame = tk.Frame(main_container, bg="#1a1a1a")
+        header_frame.pack(fill=tk.X, pady=(0, 10))
+
+        title_label = tk.Label(header_frame, 
+                               text="🛡️ DRONE TESPİT SİSTEMİ",
+                               font=("Arial", 18, "bold"),
+                               bg="#1a1a1a", fg="#00ff00")
+        title_label.pack(side=tk.LEFT, padx=10)
+
+        # Kullanıcı bilgileri ve çıkış
+        user_info_frame = tk.Frame(header_frame, bg="#1a1a1a")
+        user_info_frame.pack(side=tk.RIGHT, padx=10)
+        
+        user_label = tk.Label(user_info_frame,
+                             text=f"👤 Kullanıcı: {self.current_user['name']} ({self.current_user['username']})",
+                             font=("Arial", 10),
+                             bg="#1a1a1a", fg="#ffffff")
+        user_label.pack(side=tk.LEFT, padx=(0, 10))
+        
+        logout_button = tk.Button(user_info_frame,
+                                 text="🚪 Çıkış",
+                                 font=("Arial", 10, "bold"),
+                                 bg="#cc0000", fg="#ffffff",
+                                 command=self.logout)
+        logout_button.pack(side=tk.LEFT)
+
+        # Navigasyon butonları
+        nav_button_frame = tk.Frame(header_frame, bg="#1a1a1a")
+        nav_button_frame.pack(side=tk.RIGHT, padx=(0, 150))
+
+        self.home_button = tk.Button(nav_button_frame,
+                                     text="🏠 Ana Ekran",
+                                     font=("Arial", 10, "bold"),
+                                     bg="#0066cc", fg="#ffffff",
+                                     command=lambda: self.show_frame(self.main_detection_frame))
+        self.home_button.pack(side=tk.LEFT, padx=5)
+
+        self.reports_button = tk.Button(nav_button_frame,
+                                        text="📋 Raporlar",
+                                        font=("Arial", 10, "bold"),
+                                        bg="#0066cc", fg="#ffffff",
+                                        command=lambda: self.show_frame(self.reports_frame))
+        self.reports_button.pack(side=tk.LEFT, padx=5)
+
+        # Ana tespit ekranı frame
+        self.main_detection_frame = tk.Frame(main_container, bg="#1a1a1a")
+        self.main_detection_frame.pack(fill=tk.BOTH, expand=True)
+
+        # Raporlar ekranı frame (başlangıçta gizli)
+        self.reports_frame = tk.Frame(main_container, bg="#1a1a1a")
+        
+        # --- Sol Panel (Bağlantı, Harita, Kontrol) ---
+        left_panel = tk.Frame(self.main_detection_frame, bg="#2c2c2c", relief=tk.RAISED, bd=2)
+        left_panel.pack(side=tk.LEFT, fill=tk.BOTH, expand=True, padx=(0, 5))
+        
+        # --- Sağ Panel (Drone Detayları, Tablo) ---
+        right_panel = tk.Frame(self.main_detection_frame, bg="#2c2c2c", relief=tk.RAISED, bd=2, width=500)
+        right_panel.pack(side=tk.RIGHT, fill=tk.BOTH, padx=(5, 0))
+        right_panel.pack_propagate(False)
+        
+        # --- Bağlantı Ayarları Frame ---
+        connection_frame = tk.LabelFrame(left_panel, 
+                                         text="📡 Bağlantı Ayarları",
+                                         font=("Arial", 10, "bold"),
+                                         bg="#2c2c2c", fg="#ffffff")
+        connection_frame.pack(fill=tk.X, padx=10, pady=5)
+        
+        # IP Giriş Alanı
+        ip_label = tk.Label(connection_frame, text="Sunucu IP:", bg="#2c2c2c", fg="#ffffff", font=("Arial", 10))
+        ip_label.pack(side=tk.LEFT, padx=(5, 2), pady=5)
+        self.ip_entry = tk.Entry(connection_frame, width=15, font=("Arial", 10), bg="#3a3a3a", fg="#ffffff", insertbackground="#ffffff")
+        self.ip_entry.insert(0, self.default_server_host)
+        self.ip_entry.pack(side=tk.LEFT, padx=(0, 10), pady=5)
+
+        # Port Giriş Alanı
+        port_label = tk.Label(connection_frame, text="Port:", bg="#2c2c2c", fg="#ffffff", font=("Arial", 10))
+        port_label.pack(side=tk.LEFT, padx=(5, 2), pady=5)
+        self.port_entry = tk.Entry(connection_frame, width=7, font=("Arial", 10), bg="#3a3a3a", fg="#ffffff", insertbackground="#ffffff")
+        self.port_entry.insert(0, str(self.default_server_port))
+        self.port_entry.pack(side=tk.LEFT, padx=(0, 10), pady=5)
+
+        # Bağlan Butonu
+        self.connect_button_ui = tk.Button(connection_frame,
+                                           text="Bağlan",
+                                           font=("Arial", 10, "bold"),
+                                           bg="#008000", fg="#ffffff",
+                                           command=self.initiate_connection_from_ui)
+        self.connect_button_ui.pack(side=tk.LEFT, padx=(0, 5), pady=5)
+
+        # Bağlantı Durum Etiketi
+        self.connection_status = tk.Label(connection_frame,
+                                         text="🔄 Bağlantı Bekleniyor...",
+                                         font=("Arial", 10),
+                                         bg="#2c2c2c", fg="#ffff00")
+        self.connection_status.pack(side=tk.LEFT, padx=5)
+        
+        # Sunucu Bilgi Etiketi
+        self.server_info = tk.Label(connection_frame,
+                                   text=f"Hedef: {self.default_server_host}:{self.default_server_port}",
+                                   font=("Arial", 9),
+                                   bg="#2c2c2c", fg="#cccccc")
+        self.server_info.pack(side=tk.RIGHT, padx=5)
+        
+        # --- Harita Görünümü Frame ---
+        map_frame = tk.LabelFrame(left_panel,
+                                 text="🗺️ Harita Görünümü",
+                                 font=("Arial", 12, "bold"),
+                                 bg="#2c2c2c", fg="#ffffff")
+        map_frame.pack(fill=tk.BOTH, expand=True, padx=10, pady=5)
+        
+        self.map_canvas = Canvas(map_frame, bg="#0d4f3c", width=600, height=400)
+        self.map_canvas.pack(fill=tk.BOTH, expand=True, padx=5, pady=5)
+
+        # --- Kontrol Paneli Frame ---
+        control_frame = tk.LabelFrame(left_panel,
+                                     text="🎯 Kontrol Paneli",
+                                     font=("Arial", 12, "bold"),
+                                     bg="#2c2c2c", fg="#ffffff")
+        control_frame.pack(fill=tk.X, padx=10, pady=5)
+        
+        status_row = tk.Frame(control_frame, bg="#2c2c2c")
+        status_row.pack(fill=tk.X, padx=5, pady=5)
+        
+        self.threat_level_label = tk.Label(status_row,
+                                         text="TEHLİKE: YOK",
+                                         font=("Arial", 14, "bold"),
+                                         bg="#2c2c2c", fg="#00ff00")
+        self.threat_level_label.pack(side=tk.LEFT)
+        
+        self.drone_count_label = tk.Label(status_row,
+                                         text="Drone: 0",
+                                         font=("Arial", 12),
+                                         bg="#2c2c2c", fg="#ffffff")
+        self.drone_count_label.pack(side=tk.RIGHT)
+        
+        button_row = tk.Frame(control_frame, bg="#2c2c2c")
+        button_row.pack(fill=tk.X, padx=5, pady=5)
+        
+        # Ateş etme butonu - role göre kontrol
+        fire_enabled = self.current_user["role"] in ["admin", "yonetici", "operator"]
+        self.fire_button = tk.Button(button_row,
+                                     text="🎯 ATEŞ ET",
+                                     font=("Arial", 14, "bold"),
+                                     bg="#666666" if not fire_enabled else "#ff0000",
+                                     fg="#ffffff",
+                                     state=tk.DISABLED if not fire_enabled else tk.NORMAL,
+                                     command=self.fire_command,
+                                     height=2,
+                                     relief=tk.RAISED)
+        self.fire_button.pack(side=tk.LEFT, fill=tk.X, expand=True, padx=(0, 5))
+        
+        self.reconnect_button = tk.Button(button_row,
+                                         text="🔄 Yeniden Bağlan",
+                                         font=("Arial", 10),
+                                         bg="#0066cc",
+                                         fg="#ffffff",
+                                         command=self.reconnect)
+        self.reconnect_button.pack(side=tk.RIGHT)
+        
+        # --- Drone Detayları Başlık ---
+        details_title = tk.Label(right_panel,
+                               text="📊 DRONE DETAYLARI",
+                               font=("Arial", 14, "bold"),
+                               bg="#2c2c2c", fg="#ffffff")
+        details_title.pack(pady=10)
+        
+        # --- Tespit Tablosu Frame ---
+        table_frame = tk.LabelFrame(right_panel,
+                                   text="📋 Tespit Tablosu",
+                                   font=("Arial", 10, "bold"),
+                                   bg="#2c2c2c", fg="#ffffff")
+        table_frame.pack(fill=tk.BOTH, expand=True, padx=10, pady=5)
+        
+        # Treeview stil ayarları
+        style = ttk.Style()
+        style.theme_use('clam')
+        style.configure("GPS.Treeview",
+                        background="#1a1a1a",
+                        foreground="#ffffff",
+                        rowheight=25,
+                        fieldbackground="#1a1a1a")
+        style.configure("GPS.Treeview.Heading",
+                        background="#0066cc",
+                        foreground="#ffffff",
+                        font=("Arial", 9, "bold"))
+        
+        # Treeview sütunları
+        columns = ("ID", "Tehlike Seviyesi", "Güven", "Bölge", "X Ekseni", "Y Ekseni")
+        self.drone_tree = ttk.Treeview(table_frame, 
+                                       columns=columns, 
+                                       show="headings",
+                                       style="GPS.Treeview",
+                                       height=8)
+        
+        # Sütun başlıkları ve genişlikleri
+        widths = [40, 120, 60, 80, 70, 70]
+        for i, col in enumerate(columns):
+            self.drone_tree.heading(col, text=col)
+            self.drone_tree.column(col, width=widths[i], anchor=tk.CENTER)
+        
+        # Kaydırma çubuğu
+        tree_scroll = ttk.Scrollbar(table_frame, orient=tk.VERTICAL, command=self.drone_tree.yview)
+        self.drone_tree.configure(yscrollcommand=tree_scroll.set)
+        
+        self.drone_tree.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+        tree_scroll.pack(side=tk.RIGHT, fill=tk.Y)
+        
+        # Son Güncelleme Etiketi
+        self.timestamp_label = tk.Label(right_panel,
+                                         text="Son Güncelleme: --",
+                                         font=("Arial", 9),
+                                         bg="#2c2c2c", fg="#cccccc")
+        self.timestamp_label.pack(pady=5)
+        
+        # --- Raporlar Ekranı Kurulumu ---
+        self.setup_reports_ui()
+
+        # Harita tabanını çizmek için gecikmeli çağrı
+        self.window.after(500, self.draw_map_base)
+
+        # Başlangıçta Ana Ekranı Göster
+        self.show_frame(self.main_detection_frame)
+    
+    def setup_reports_ui(self):
+        """Raporlar ekranı arayüzünü kurar"""
+        self.reports_frame.config(bg="#1a1a1a")
+        
+        reports_title = tk.Label(self.reports_frame,
+                                 text="📊 DRONE TESPİT RAPORLARI",
+                                 font=("Arial", 18, "bold"),
+                                 bg="#1a1a1a", fg="#00ff00")
+        reports_title.pack(pady=20)
+
+        reports_table_frame = tk.LabelFrame(self.reports_frame,
+                                            text="📋 Tespit Geçmişi Tablosu",
+                                            font=("Arial", 12, "bold"),
+                                            bg="#2c2c2c", fg="#ffffff")
+        reports_table_frame.pack(fill=tk.BOTH, expand=True, padx=20, pady=10)
+
+        # Raporlar tablosu sütunları
+        report_columns = ("Tespit Saati", "ID", "Güven", "Bölge", "Tehlike Seviyesi", "X Ekseni", "Y Ekseni")
+        self.reports_tree = ttk.Treeview(reports_table_frame,
+                                         columns=report_columns,
+                                         show="headings",
+                                         style="GPS.Treeview")
+
+        report_widths = [180, 60, 80, 120, 120, 70, 70]
+        for i, col in enumerate(report_columns):
+            self.reports_tree.heading(col, text=col)
+            self.reports_tree.column(col, width=report_widths[i], anchor=tk.CENTER)
+
+        report_tree_scroll_y = ttk.Scrollbar(reports_table_frame, orient=tk.VERTICAL, command=self.reports_tree.yview)
+        report_tree_scroll_x = ttk.Scrollbar(reports_table_frame, orient=tk.HORIZONTAL, command=self.reports_tree.xview)
+        self.reports_tree.configure(yscrollcommand=report_tree_scroll_y.set, xscrollcommand=report_tree_scroll_x.set)
+
+        self.reports_tree.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+        report_tree_scroll_y.pack(side=tk.RIGHT, fill=tk.Y)
+        report_tree_scroll_x.pack(side=tk.BOTTOM, fill=tk.X)
+
+    def show_frame(self, frame):
+        """Belirtilen frame'i gösterir ve diğerlerini gizler"""
+        self.main_detection_frame.pack_forget()
+        self.reports_frame.pack_forget()
+        
+        frame.pack(fill=tk.BOTH, expand=True)
+        
+        # Raporlar ekranına geçiş yaparken tabloyu güncelle
+        if frame == self.reports_frame:
+            self.update_reports_table()
+
+    def draw_map_base(self):
+        """Harita canvas'ının taban ızgarasını ve yön göstergelerini çizer"""
+        self.map_canvas.delete("all")
+        width = self.map_canvas.winfo_width()
+        height = self.map_canvas.winfo_height()
+        
+        # Canvas boyutları henüz belirlenmediyse yeniden dene
+        if width <= 1 or height <= 1:
+            self.window.after(500, self.draw_map_base)
+            return
+        
+        # Koordinat sistemi için merkez hesapla
+        center_x, center_y = width // 2, height // 2
+        
+        # Koordinat sistemi için ızgara çizgileri (-1.0 to 1.0)
+        # X ekseni çizgileri (dikey) - BATI(-1.0) sol, DOĞU(+1.0) sağ
+        for i in range(-10, 11):
+            x_coord = center_x + (i * 0.1) * (width / 2)
+            self.map_canvas.create_line(x_coord, 0, x_coord, height, fill="#0a3d2e", width=1)
+            # X ekseni etiketleri
+            if i % 2 == 0:
+                label_x = x_coord
+                label_y = center_y + 15
+                self.map_canvas.create_text(label_x, label_y, text=f"{i * 0.1:.1f}", fill="#ffffff", font=("Arial", 7))
+
+        # Y ekseni çizgileri (yatay) - GÜNEY(-1.0) alt, KUZEY(+1.0) üst
+        for i in range(-10, 11):
+            y_coord = center_y - (i * 0.1) * (height / 2)
+            self.map_canvas.create_line(0, y_coord, width, y_coord, fill="#0a3d2e", width=1)
+            # Y ekseni etiketleri
+            if i % 2 == 0:
+                label_x = center_x - 20
+                label_y = y_coord
+                self.map_canvas.create_text(label_x, label_y, text=f"{i * 0.1:.1f}", fill="#ffffff", font=("Arial", 7))
+        
+        # Merkez çizgiler (X ve Y eksenleri)
+        self.map_canvas.create_line(center_x, 0, center_x, height, fill="#1a5c42", width=2)
+        self.map_canvas.create_line(0, center_y, width, center_y, fill="#1a5c42", width=2)
+        
+        # Ana yön göstergeleri
+        self.map_canvas.create_text(center_x, 15, text="KUZEY ↑ (+Y)", fill="#ffffff", font=("Arial", 10, "bold"))
+        self.map_canvas.create_text(center_x, height-15, text="GÜNEY ↓ (-Y)", fill="#ffffff", font=("Arial", 10, "bold"))
+        self.map_canvas.create_text(20, center_y, text="BATI ← (-X)", fill="#ffffff", font=("Arial", 10, "bold"), angle=90)
+        self.map_canvas.create_text(width-20, center_y, text="DOĞU → (+X)", fill="#ffffff", font=("Arial", 10, "bold"), angle=90)
+        
+        # Ara yön göstergeleri
+        offset = 30
+        self.map_canvas.create_text(offset, offset, text="KUZEYBATI ↖ (-X,+Y)", fill="#ffffff", font=("Arial", 8, "bold"), anchor="nw")
+        self.map_canvas.create_text(width - offset, offset, text="KUZEYDOĞU ↗ (+X,+Y)", fill="#ffffff", font=("Arial", 8, "bold"), anchor="ne")
+        self.map_canvas.create_text(offset, height - offset, text="GÜNEYBATI ↙ (-X,-Y)", fill="#ffffff", font=("Arial", 8, "bold"), anchor="sw")
+        self.map_canvas.create_text(width - offset, height - offset, text="GÜNEYDOĞU ↘ (+X,-Y)", fill="#ffffff", font=("Arial", 8, "bold"), anchor="se")
+
+        # Merkez nokta (0,0)
+        self.map_canvas.create_oval(center_x-5, center_y-5, center_x+5, center_y+5, 
+                                     fill="#ffff00", outline="#000000", width=2, tags="center")
+        self.map_canvas.create_text(center_x+15, center_y-15, text="(0,0)", fill="#ffff00", font=("Arial", 9, "bold"))
+    
+    def update_map(self):
+        """Harita canvas'ında drone pozisyonlarını günceller"""
+        self.map_canvas.delete("drone")
+        
+        width = self.map_canvas.winfo_width()
+        height = self.map_canvas.winfo_height()
+        center_x, center_y = width//2, height//2
+        
+        for detection in self.current_data.get("detections", []):
+            pos = detection.get("position", {})
+            
+            # Server ile tam uyumlu koordinat sistemi
+            raw_map_x = pos.get("map_x", 0.5)
+            raw_map_y = pos.get("map_y", 0.5)
+            
+            # Server ile aynı dönüşüm algoritması
+            normalized_x = -((raw_map_x * 2) - 1)
+            normalized_y = -((raw_map_y * 2) - 1)
+
+            # Normalized koordinatları canvas piksel koordinatlarına dönüştür
+            map_x_pixel = center_x + (normalized_x * (width / 2))
+            map_y_pixel = center_y - (normalized_y * (height / 2))
+            
+            drone_id = detection.get("id", "?")
+            confidence = detection.get("confidence", 0)
+            
+            # Drone'u daire olarak çiz
+            self.map_canvas.create_oval(map_x_pixel-8, map_y_pixel-8, map_x_pixel+8, map_y_pixel+8,
+                                         fill="#ff0000", outline="#ffffff", width=2, tags="drone")
+            # Drone ID'sini yaz
+            self.map_canvas.create_text(map_x_pixel, map_y_pixel, text=str(drone_id), 
+                                         fill="#ffffff", font=("Arial", 8, "bold"), tags="drone")
+            # Merkezden drone'a kesikli çizgi çiz
+            self.map_canvas.create_line(center_x, center_y, map_x_pixel, map_y_pixel, 
+                                         fill="#00ff00", width=1, dash=(5, 5), tags="drone")
+            
+            # Drone yakınına koordinat bilgisi ekle
+            coord_text = f"({normalized_x:.2f},{normalized_y:.2f})"
+            self.map_canvas.create_text(map_x_pixel, map_y_pixel+15, text=coord_text, 
+                                         fill="#00ff00", font=("Arial", 7), tags="drone")
+
+    def initiate_connection_from_ui(self):
+        """UI giriş alanlarından IP ve Port alarak bağlantıyı başlatır"""
+        if not self.logged_in:
+            self.show_message_box("Erişim Hatası", "Bu işlem için giriş yapmanız gerekli!", "error")
+            return
+            
+        host = self.ip_entry.get()
+        port_str = self.port_entry.get()
+
+        if not host:
+            self.show_message_box("Bağlantı Hatası", "Lütfen sunucu IP adresini girin.", "error")
+            return
+
+        try:
+            port = int(port_str)
+            if not (1 <= port <= 65535):
+                raise ValueError("Port 1-65535 arasında olmalıdır.")
+        except ValueError:
+            self.show_message_box("Bağlantı Hatası", "Geçerli bir port numarası girin (örn: 8888).", "error")
+            return
+        
+        # Mevcut socket'i kapat (varsa)
+        if self.socket:
+            try:
+                self.socket.close()
+            except:
+                pass
+            self.connected = False
+            self.socket = None
+
+        self.connection_status.config(text="🔄 Bağlanıyor...", fg="#ffff00")
+        self.server_info.config(text=f"Hedef: {host}:{port}")
+        self.connect_to_server(host, port)
+
+    def connect_to_server(self, host, port):
+        """Belirtilen sunucuya bağlanmayı dener"""
+        def connect_thread():
+            try:
+                self.socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+                self.socket.settimeout(5.0)
+                self.socket.connect((host, port))
+                self.connected = True
+                
+                # Kullanıcı giriş bilgisini gönder
+                if self.logged_in and self.current_user:
+                    login_info = {
+                        "type": "login",
+                        "username": self.current_user["username"],
+                        "password": self.users[self.current_user["username"]]["password"],
+                        "name": self.current_user["name"],
+                        "timestamp": datetime.now().strftime('%Y-%m-%d %H:%M:%S.%f')[:-3]
+                    }
+                    self.socket.send((json.dumps(login_info) + "\n").encode('utf-8'))
+                
+                self.window.after(0, lambda: self.connection_status.config(
+                    text="✅ Bağlandı", fg="#00ff00"))
+                self.window.after(0, lambda: self.server_info.config(
+                    text=f"Bağlı: {host}:{port}"))
+                
+                # Sunucudan veri dinlemeyi başlat
+                threading.Thread(target=self.listen_server, daemon=True).start()
+            except Exception as e:
+                self.connected = False
+                self.window.after(0, lambda: self.connection_status.config(
+                    text="❌ Bağlantı Hatası", fg="#ff0000"))
+                self.window.after(0, lambda: self.server_info.config(
+                    text=f"Hedef: {host}:{port} (Bağlantı Hatası)"))
+                print(f"Bağlantı hatası: {e}")
+        
+        threading.Thread(target=connect_thread, daemon=True).start()
+        
+    def listen_server(self):
+        """Sunucudan gelen verileri dinler ve işler"""
+        buffer = ""
+        while self.connected and self.running:
+            try:
+                data = self.socket.recv(1024).decode('utf-8')
+                if not data:
+                    break
+                buffer += data
+                while '\n' in buffer:
+                    line, buffer = buffer.split('\n', 1)
+                    if line.strip():
+                        try:
+                            response = json.loads(line)
+                            
+                            # Giriş yanıtı kontrolü
+                            if response.get("type") == "login_response":
+                                if response.get("success"):
+                                    print("Sunucu tarafından giriş doğrulandı")
+                                else:
+                                    self.show_message_box("Giriş Hatası", response.get("message", "Sunucu tarafından giriş reddedildi"), "error")
+                                    self.logout()
+                            # Ateş komutu yanıtı
+                            elif response.get("type") == "fire_response":
+                                self.window.after(0, lambda r=response: self.handle_fire_response(r))
+                            else:
+                                # Normal drone verisi
+                                self.current_data = response
+                                self.window.after(0, self.update_ui)
+                                self.window.after(0, self.add_to_history)
+                        except json.JSONDecodeError:
+                            print(f"JSON Ayrıştırma Hatası: {line}")
+                            pass
+            except socket.timeout:
+                continue
+            except ConnectionResetError:
+                print("Sunucu bağlantıyı sıfırladı.")
+                break
+            except Exception as e:
+                print(f"Veri alma hatası: {e}")
+                break
+                
+        # Bağlantı kesildiğinde durumu güncelle
+        self.connected = False
+        self.window.after(0, lambda: self.connection_status.config(
+            text="❌ Bağlantı Kesildi", fg="#ff0000"))
+        self.window.after(0, lambda: self.server_info.config(
+            text=f"Bağlı Değil"))
+        
+        # Uygulama hala çalışıyorsa otomatik yeniden bağlanmayı dene
+        if self.running:
+            threading.Timer(3.0, self.reconnect).start()
+            
+    def handle_fire_response(self, response):
+        """Sunucudan gelen ateş komutu yanıtını işler"""
+        success = response.get("success", False)
+        message = response.get("message", "")
+        if success:
+            self.show_message_box("Ateş Etme Sonucu", f"✅ {message}", "info")
+        else:
+            self.show_message_box("Ateş Etme Sonucu", f"❌ {message}", "error")
+    
+    def add_to_history(self):
+        """Mevcut tespit verilerini geçmişe ekler"""
+        timestamp = self.current_data.get("timestamp", "--")
+        threat_level = self.current_data.get("threat_level", "YOK")
+
+        for detection in self.current_data.get("detections", []):
+            pos = detection.get("position", {})
+            
+            raw_map_x = pos.get("map_x", 0.5)
+            raw_map_y = pos.get("map_y", 0.5)
+            
+            display_x = -((raw_map_x * 2) - 1)
+            display_y = -((raw_map_y * 2) - 1)
+            
+            zone_name = pos.get("zone", self.get_direction_from_coordinates(display_x, display_y))
+            
+            history_entry = {
+                "timestamp": timestamp,
+                "id": detection.get("id", "-"),
+                "confidence": detection.get("confidence", 0),
+                "zone": zone_name,
+                "threat_level": threat_level,
+                "display_x": display_x,
+                "display_y": display_y
+            }
+            self.detection_history.append(history_entry)
+
+    def update_ui(self):
+        """Gelen verilere göre kullanıcı arayüzünü günceller"""
+        if not self.logged_in:
+            return
+            
+        data = self.current_data
+        threat_colors = {
+            "YOK": "#00ff00",
+            "DUSUK": "#00ff00", 
+            "ORTA SEVİYE": "#ff8800",
+            "YUKSEK TEHLİKE": "#ff0000"
+        }
+        
+        # Tehlike seviyesini ve rengini güncelle
+        self.threat_level_label.config(
+            text=f"TEHLİKE: {data.get('threat_level', 'YOK')}",
+            fg=threat_colors.get(data.get('threat_level', 'YOK'), "#ffffff")
+        )
+        # Drone sayısını güncelle
+        self.drone_count_label.config(text=f"Drone: {data.get('drone_count', 0)}")
+        # Zaman damgasını güncelle
+        self.timestamp_label.config(text=f"Son Güncelleme: {data.get('timestamp', '--')}")
+        
+        # "ATEŞ ET" buton durumunu güncelle
+        if data.get("fire_authorized", False) and self.current_user["role"] in ["admin", "yonetici", "operator"]:
+            self.fire_button.config(state=tk.NORMAL, bg="#ff0000")
+        else:
+            self.fire_button.config(state=tk.DISABLED, bg="#666666")
+        
+        self.update_table()
+        self.update_map()
+    
+    def update_table(self):
+        """Ana ekrandaki tespit tablosunu günceller"""
+        for item in self.drone_tree.get_children():
+            self.drone_tree.delete(item)
+        
+        current_threat_level = self.current_data.get("threat_level", "YOK")
+        
+        for detection in self.current_data.get("detections", []):
+            pos = detection.get("position", {})
+            
+            raw_map_x = pos.get("map_x", 0.5)
+            raw_map_y = pos.get("map_y", 0.5)
+            
+            display_x = -((raw_map_x * 2) - 1)
+            display_y = -((raw_map_y * 2) - 1)
+
+            direction = self.get_direction_from_coordinates(display_x, display_y)
+            zone_name = pos.get("zone", direction)
+
+            values = (
+                f"D{detection.get('id', '-'):03d}",
+                current_threat_level,
+                f"{detection.get('confidence', 0):.1f}%",
+                zone_name,
+                f"{display_x:.2f}",
+                f"{display_y:.2f}"
+            )
+            self.drone_tree.insert("", tk.END, values=values)
+
+    def get_direction_from_coordinates(self, x, y):
+        """Normalize edilmiş koordinatlara göre yön hesaplar (-1 to 1)"""
+        tolerance = 0.1
+        
+        if abs(x) <= tolerance and abs(y) <= tolerance:
+            return "MERKEZ"
+        
+        if abs(x) <= tolerance:
+            return "KUZEY" if y > 0 else "GÜNEY"
+        elif abs(y) <= tolerance:
+            return "DOĞU" if x > 0 else "BATI"
+        else:
+            if x > 0 and y > 0:
+                return "KUZEYDOĞU"
+            elif x < 0 and y > 0:
+                return "KUZEYBATI"
+            elif x < 0 and y < 0:
+                return "GÜNEYBATI"
+            else:
+                return "GÜNEYDOĞU"
+
+    def update_reports_table(self):
+        """Raporlar ekranındaki geçmiş tespit tablosunu günceller"""
+        for item in self.reports_tree.get_children():
+            self.reports_tree.delete(item)
+        
+        # Geçmiş kayıtları yeniden eskiden yeniye doğru sırala
+        sorted_history = sorted(self.detection_history, key=lambda x: x['timestamp'], reverse=True)
+
+        for entry in sorted_history:
+            display_x = entry.get("display_x", 0.0)
+            display_y = entry.get("display_y", 0.0)
+
+            values = (
+                entry.get("timestamp", "--"),
+                f"D{entry.get('id', '-')}",
+                f"{entry.get('confidence', 0):.1f}%",
+                entry.get("zone", self.get_direction_from_coordinates(display_x, display_y)),
+                entry.get("threat_level", "YOK"),
+                f"{display_x:.2f}",
+                f"{display_y:.2f}"
+            )
+            self.reports_tree.insert("", tk.END, values=values)
+    
+    def fire_command(self):
+        """'FIRE' komutunu sunucuya gönderir ve yanıtı işler"""
+        if not self.logged_in:
+            self.show_message_box("Erişim Hatası", "Bu işlem için giriş yapmanız gerekli!", "error")
+            return
+            
+        if not self.connected:
+            self.show_message_box("Hata", "Sunucuya bağlı değilsiniz!", "error")
+            return
+            
+        # Kullanıcının ateş etme yetkisi var mı kontrol et
+        if self.current_user["role"] not in ["admin", "yonetici", "operator"]:
+            self.show_message_box("Yetki Hatası", "Ateş etme yetkiniz bulunmamaktadır!", "error")
+            return
+            
+        try:
+            command = {
+                "command": "FIRE",
+                "timestamp": datetime.now().strftime('%Y-%m-%d %H:%M:%S.%f')[:-3],
+                "client_id": "gps_client_1",
+                "user": self.current_user["username"]
+            }
+            self.socket.send((json.dumps(command) + "\n").encode('utf-8'))
+        except Exception as e:
+            self.show_message_box("Hata", f"Komut gönderilemedi: {str(e)}", "error")
+    
+    def reconnect(self):
+        """Mevcut IP/Port değerlerini kullanarak yeniden bağlanmayı dener"""
+        if not self.logged_in:
+            return
+            
+        if self.connected:
+            try:
+                self.socket.close()
+            except:
+                pass
+            self.connected = False
+            self.socket = None
+            
+        host = self.ip_entry.get()
+        port_str = self.port_entry.get()
+
+        if not host:
+            self.show_message_box("Bağlantı Hatası", "Yeniden bağlanmak için lütfen sunucu IP adresini girin.", "error")
+            self.connection_status.config(text="❌ Bağlantı Hatası", fg="#ff0000")
+            return
+
+        try:
+            port = int(port_str)
+            if not (1 <= port <= 65535):
+                raise ValueError("Port 1-65535 arasında olmalıdır.")
+        except ValueError:
+            self.show_message_box("Bağlantı Hatası", "Yeniden bağlanmak için geçerli bir port numarası girin.", "error")
+            self.connection_status.config(text="❌ Bağlantı Hatası", fg="#ff0000")
+            return
+
+        self.connection_status.config(text="🔄 Yeniden Bağlanıyor...", fg="#ffff00")
+        self.server_info.config(text=f"Hedef: {host}:{port}")
+        threading.Thread(target=self.connect_to_server, args=(host, port), daemon=True).start()
+    
+    def show_message_box(self, title, message, type="info"):
+        """Özel mesaj kutusu fonksiyonu"""
+        if type == "info":
+            messagebox.showinfo(title, message)
+        elif type == "error":
+            messagebox.showerror(title, message)
+        elif type == "warning":
+            messagebox.showwarning(title, message)
+
+    def logout(self):
+        """Kullanıcıyı çıkış yapar ve giriş ekranına döner"""
+        if messagebox.askyesno("Çıkış", "Sistemden çıkmak istediğinizden emin misiniz?"):
+            # Bağlantıyı kapat (varsa)
+            if self.socket:
+                try:
+                    # Çıkış bilgisini sunucuya gönder
+                    logout_info = {
+                        "type": "logout",
+                        "username": self.current_user["username"],
+                        "timestamp": datetime.now().strftime('%Y-%m-%d %H:%M:%S.%f')[:-3]
+                    }
+                    self.socket.send((json.dumps(logout_info) + "\n").encode('utf-8'))
+                    self.socket.close()
+                except:
+                    pass
+                self.connected = False
+                self.socket = None
+            
+            # Giriş değişkenlerini sıfırla
+            self.logged_in = False
+            self.login_attempts = 0
+            self.current_user = None
+            
+            # Mevcut pencereyi kapat ve yeniden başlat
+            self.window.destroy()
+            self.__init__()
+            self.run()
+    
+    def on_closing(self):
+        """Pencere kapatıldığında çağrılır, bağlantı ve thread'leri temizler"""
+        self.running = False
+        self.connected = False
+        
+        if self.socket:
+            try:
+                self.socket.close()
+            except:
+                pass
+        
+        self.window.destroy()
+    
+    def run(self):
+        """Uygulamayı çalıştırır"""
+        self.window.mainloop()
+
+# Ana program
+if __name__ == "__main__":
+    client = DroneDetectionClient()
+    client.run()
