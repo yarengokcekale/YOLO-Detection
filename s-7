@@ -1,0 +1,1164 @@
+import cv2
+from ultralytics import YOLO
+import pygame
+import tkinter as tk
+from tkinter import ttk
+from datetime import datetime
+from PIL import Image, ImageTk
+import numpy as np
+import socket
+import threading
+import json
+import time
+import pandas as pd
+from tkinter import filedialog, messagebox
+import random
+import os
+
+# Model ve ses dosyası yolları
+model_path = r"C:\Users\yaren\OneDrive\Masaüstü\drone_dataset\runs\detect\train\weights\best.pt"
+sound_path = r"C:\Users\yaren\OneDrive\Masaüstü\drone_dataset\alert.wav"
+json_path = r"C:\Users\yaren\OneDrive\Masaüstü\drone_dataset\kullanici_bilgileri.json"
+
+# Modeli yükle
+try:
+    model = YOLO(model_path)
+    print("AI Model başarıyla yüklendi")
+except Exception as e:
+    print(f"Model yükleme hatası: {e}")
+    model = None
+
+# Pygame ses sistemi başlat
+pygame.init()
+pygame.mixer.init()
+try:
+    pygame.mixer.music.load(sound_path)
+    print("Ses dosyası başarıyla yüklendi")
+except Exception as e:
+    print(f"Ses dosyası yükleme hatası: {e}")
+
+# TCP Server ayarları
+SERVER_HOST = '127.0.0.1'  # localhost
+SERVER_PORT = 8888
+connected_clients = []
+
+# Global değişkenler - Client ile uyumlu format
+current_drone_data = {
+    "drone_count": 0,
+    "threat_level": "YOK",
+    "detections": [],
+    "timestamp": "",
+    "fire_authorized": False
+}
+
+# Raporlar için geçmiş veriler
+detection_history = []
+max_history = 1000
+
+# Ateş geçmişi
+fire_history = []
+max_fire_history = 1000
+
+# Kullanıcı aktiviteleri
+user_activities = {}
+active_users = {}
+
+# ===== KULLANICI YÖNETİMİ FONKSİYONLARI =====
+def load_users_from_json():
+    """JSON dosyasından kullanıcı bilgilerini yükler"""
+    users_db = {}
+    
+    try:
+        with open(json_path, 'r', encoding='utf-8') as f:
+            user_list = json.load(f)
+            
+        for user in user_list:
+            username = user.get("kullanici_adi")
+            password = user.get("kullanici_sifre")
+            role = user.get("kullanici_yetkisi")
+            
+            if username and password and role:
+                users_db[username] = {
+                    "password": password,
+                    "name": username,
+                    "role": role
+                }
+        
+        print(f"Sunucu: {len(users_db)} kullanıcı başarıyla yüklendi")
+        return users_db
+        
+    except FileNotFoundError:
+        print(f"Sunucu Hatası: {json_path} dosyası bulunamadı")
+        return {}
+    except json.JSONDecodeError:
+        print(f"Sunucu Hatası: {json_path} geçersiz JSON formatı")
+        return {}
+    except Exception as e:
+        print(f"Sunucu Beklenmeyen Hata: {str(e)}")
+        return {}
+
+# Kullanıcı veritabanını yükle
+users_db = load_users_from_json()
+
+# ===== YÖN FONKSİYONLARI =====
+def get_direction_from_coordinates(x, y):
+    """Client ile aynı yön hesaplama algoritması"""
+    tolerance = 0.1
+    
+    if abs(x) <= tolerance and abs(y) <= tolerance:
+        return "MERKEZ"
+    
+    if abs(x) <= tolerance:
+        return "KUZEY" if y > 0 else "GÜNEY"
+    elif abs(y) <= tolerance:
+        return "DOĞU" if x > 0 else "BATI"
+    else:
+        if x > 0 and y > 0:
+            return "KUZEYDOĞU"
+        elif x < 0 and y > 0:
+            return "KUZEYBATI"
+        elif x < 0 and y < 0:
+            return "GÜNEYBATI"
+        else:
+            return "GÜNEYDOĞU"
+
+# ===== ARAYÜZ GÜNCELLEME FONKSİYONLARI =====
+def update_current_tree():
+    """Anlık tespitler tablosunu güncelle"""
+    for item in current_tree.get_children():
+        current_tree.delete(item)
+    
+    for detection in current_drone_data.get("detections", []):
+        pos = detection["position"]
+        
+        normalized_x = -((pos.get("map_x", 0.5) * 2) - 1)
+        normalized_y = -((pos.get("map_y", 0.5) * 2) - 1)
+        
+        zone_name = get_direction_from_coordinates(normalized_x, normalized_y)
+        
+        current_tree.insert("", "end", values=(
+            f"D{detection['id']:03d}",
+            current_drone_data.get("threat_level", "YOK"),
+            f"{detection['confidence']:.1f}%",
+            zone_name,
+            f"{normalized_x:.2f}",
+            f"{normalized_y:.2f}"
+        ))
+
+def update_history_tree():
+    """Geçmiş tespitler tablosunu güncelle"""
+    for item in history_tree.get_children():
+        history_tree.delete(item)
+    
+    for detection in reversed(detection_history[-100:]):
+        history_tree.insert("", "end", values=(
+            detection["timestamp"],
+            detection["id"],
+            f"{detection['confidence']:.1f}%",
+            detection["zone"],
+            detection["threat_level"],
+            f"{detection['display_x']:.2f}",
+            f"{detection['display_y']:.2f}"
+        ))
+
+def update_statistics():
+    """İstatistikleri güncelle"""
+    total_detections = len(detection_history)
+    high_threat = len([d for d in detection_history if d["threat_level"] == "YUKSEK TEHLİKE"])
+    medium_threat = len([d for d in detection_history if d["threat_level"] == "ORTA SEVİYE"])
+    low_threat = len([d for d in detection_history if d["threat_level"] in ["DUSUK", "YOK"]])
+    
+    avg_confidence = 0
+    if detection_history:
+        avg_confidence = sum(d["confidence"] for d in detection_history) / len(detection_history)
+    
+    if not hasattr(update_statistics, 'start_time'):
+        update_statistics.start_time = datetime.now()
+    
+    active_time = datetime.now() - update_statistics.start_time
+    active_hours = int(active_time.total_seconds() // 3600)
+    active_minutes = int((active_time.total_seconds() % 3600) // 60)
+    
+    stat_values = [
+        str(total_detections),
+        str(high_threat),
+        str(medium_threat),
+        str(low_threat),
+        f"%{avg_confidence:.1f}",
+        f"{active_hours:02d}:{active_minutes:02d}"
+    ]
+    
+    for i, value in enumerate(stat_values):
+        stat_cards[i].config(text=value)
+
+def update_fire_history_tree():
+    """Ateş geçmişi tablosunu güncelle"""
+    for item in fire_history_tree.get_children():
+        fire_history_tree.delete(item)
+    
+    for fire_event in reversed(fire_history[-100:]):
+        for drone in fire_event["drones"]:
+            result_text = "Başarılı" if fire_event["success"] else "Başarısız"
+            result_color = "green" if fire_event["success"] else "red"
+            
+            item = fire_history_tree.insert("", "end", values=(
+                fire_event["timestamp"],
+                fire_event["client_id"],
+                f"D{drone['id']:03d}",
+                drone["zone"],
+                f"{drone['confidence']:.1f}%",
+                f"{drone['x_coord']:.2f}",
+                f"{drone['y_coord']:.2f}",
+                result_text
+            ))
+            
+            fire_history_tree.item(item, tags=(result_color,))
+    
+    fire_history_tree.tag_configure("green", foreground="green")
+    fire_history_tree.tag_configure("red", foreground="red")
+
+def update_user_activity_tree():
+    """Kullanıcı aktiviteleri tablosunu güncelle"""
+    for item in user_activity_tree.get_children():
+        user_activity_tree.delete(item)
+    
+    for username, user_info in users_db.items():
+        activity = user_activities.get(username, {"login_times": [], "logout_times": [], "fire_commands": []})
+        
+        status = "Aktif" if username in active_users else "Çevrimdışı"
+        status_color = "green" if username in active_users else "red"
+        
+        session_duration = "N/A"
+        if activity["login_times"]:
+            if username in active_users:
+                login_time = datetime.strptime(activity["login_times"][-1], '%Y-%m-%d %H:%M:%S.%f')
+                now = datetime.now()
+                duration = now - login_time
+                hours, remainder = divmod(duration.total_seconds(), 3600)
+                minutes, seconds = divmod(remainder, 60)
+                session_duration = f"{int(hours)}s {int(minutes)}d {int(seconds)}s"
+            elif activity["logout_times"]:
+                login_time = datetime.strptime(activity["login_times"][-1], '%Y-%m-%d %H:%M:%S.%f')
+                logout_time = datetime.strptime(activity["logout_times"][-1], '%Y-%m-%d %H:%M:%S.%f')
+                duration = logout_time - login_time
+                hours, remainder = divmod(duration.total_seconds(), 3600)
+                minutes, seconds = divmod(remainder, 60)
+                session_duration = f"{int(hours)}s {int(minutes)}d {int(seconds)}s"
+        
+        last_activity = "N/A"
+        if activity["login_times"]:
+            last_login = activity["login_times"][-1]
+            last_logout = activity["logout_times"][-1] if activity["logout_times"] else None
+            last_fire = activity["fire_commands"][-1]["timestamp"] if activity["fire_commands"] else None
+            
+            activities = [last_login]
+            if last_logout:
+                activities.append(last_logout)
+            if last_fire:
+                activities.append(last_fire)
+            
+            last_activity = max(activities)
+        
+        fire_count = len(activity["fire_commands"])
+        
+        item = user_activity_tree.insert("", "end", values=(
+            username,
+            user_info["name"],
+            user_info["role"],
+            status,
+            session_duration,
+            last_activity,
+            fire_count
+        ))
+        
+        user_activity_tree.item(item, tags=(status_color,))
+    
+    user_activity_tree.tag_configure("green", foreground="green")
+    user_activity_tree.tag_configure("red", foreground="red")
+
+# ===== DOSYA İŞLEMLERİ =====
+def clear_detection_history():
+    """Tespit geçmişini temizle"""
+    global detection_history
+    detection_history.clear()
+    update_history_tree()
+    messagebox.showinfo("Başarılı", "Tespit geçmişi temizlendi!")
+
+def clear_fire_history():
+    """Ateş geçmişini temizle"""
+    global fire_history
+    fire_history.clear()
+    update_fire_history_tree()
+    messagebox.showinfo("Başarılı", "Ateş geçmişi temizlendi!")
+
+def export_to_excel():
+    """Raporu Excel dosyasına aktar"""
+    try:
+        if not detection_history:
+            messagebox.showwarning("Uyarı", "Dışa aktarılacak veri bulunmuyor!")
+            return
+            
+        filename = filedialog.asksaveasfilename(
+            defaultextension=".xlsx",
+            filetypes=[("Excel dosyası", "*.xlsx"), ("Tüm dosyalar", "*.*")],
+            initialfile=f"drone_report_{datetime.now().strftime('%Y-%m-%d %H:%M:%S.%f')[:-3]}.xlsx"
+        )
+        
+        if filename:
+            df = pd.DataFrame(detection_history)
+            column_order = ['timestamp', 'id', 'confidence', 'zone', 'threat_level', 'display_x', 'display_y']
+            df = df[column_order]
+            df.columns = ['Tespit Saati', 'Drone ID', 'Güven Oranı (%)', 'Bölge', 'Tehlike Seviyesi', 'X Ekseni', 'Y Ekseni']
+            
+            with pd.ExcelWriter(filename, engine='openpyxl') as writer:
+                df.to_excel(writer, sheet_name='Drone Tespitleri', index=False)
+                worksheet = writer.sheets['Drone Tespitleri']
+                column_widths = [20, 12, 15, 15, 18, 12, 12]
+                for i, width in enumerate(column_widths, 1):
+                    worksheet.column_dimensions[chr(64+i)].width = width
+                for cell in worksheet[1]:
+                    cell.font = cell.font.copy(bold=True)
+            
+            messagebox.showinfo("Başarılı", f"Rapor başarıyla Excel dosyasına kaydedildi:\n{filename}")
+    except Exception as e:
+        messagebox.showerror("Hata", f"Excel dosyası kaydedilirken hata oluştu:\n{str(e)}")
+
+def export_to_txt():
+    """Raporu TXT dosyasına aktar"""
+    try:
+        if not detection_history:
+            messagebox.showwarning("Uyarı", "Dışa aktarılacak veri bulunmuyor!")
+            return
+            
+        filename = filedialog.asksaveasfilename(
+            defaultextension=".txt",
+            filetypes=[("Metin dosyası", "*.txt"), ("Tüm dosyalar", "*.*")],
+            initialfile=f"drone_report_{datetime.now().strftime('%Y-%m-%d %H:%M:%S.%f')[:-3]}.txt"
+        )
+        
+        if filename:
+            with open(filename, 'w', encoding='utf-8') as f:
+                f.write("DRONE TESPİT RAPORU\n")
+                f.write("="*80 + "\n")
+                f.write(f"Rapor Tarihi: {datetime.now().strftime('%Y-%m-%d %H:%M:%S.%f')[:-3]}\n")
+                f.write(f"Toplam Tespit: {len(detection_history)}\n\n")
+                
+                f.write(f"{'Tespit Saati':<20} {'ID':<8} {'Güven':<8} {'Bölge':<15} {'Tehlike':<15} {'X Eks':<8} {'Y Eks':<8}\n")
+                f.write("-" * 95 + "\n")
+                
+                for detection in detection_history:
+                    f.write(f"{detection['timestamp']:<20} ")
+                    f.write(f"{detection['id']:<8} ")
+                    f.write(f"{detection['confidence']:<8.1f} ")
+                    f.write(f"{detection['zone']:<15} ")
+                    f.write(f"{detection['threat_level']:<15} ")
+                    f.write(f"{detection['display_x']:<8.2f} ")
+                    f.write(f"{detection['display_y']:<8.2f}\n")
+            
+            messagebox.showinfo("Başarılı", f"Rapor başarıyla TXT dosyasına kaydedildi:\n{filename}")
+    except Exception as e:
+        messagebox.showerror("Hata", f"TXT dosyası kaydedilirken hata oluştu:\n{str(e)}")
+
+def export_fire_history_to_excel():
+    """Ateş geçmişini Excel dosyasına aktar"""
+    try:
+        if not fire_history:
+            messagebox.showwarning("Uyarı", "Dışa aktarılacak veri bulunmuyor!")
+            return
+            
+        filename = filedialog.asksaveasfilename(
+            defaultextension=".xlsx",
+            filetypes=[("Excel dosyası", "*.xlsx"), ("Tüm dosyalar", "*.*")],
+            initialfile=f"fire_history_{datetime.now().strftime('%Y-%m-%d %H:%M:%S.%f')[:-3]}.xlsx"
+        )
+        
+        if filename:
+            export_data = []
+            for fire_event in fire_history:
+                for drone in fire_event["drones"]:
+                    export_data.append({
+                        "Tarih": fire_event["timestamp"],
+                        "İstemci": fire_event["client_id"],
+                        "Drone ID": f"D{drone['id']:03d}",
+                        "Bölge": drone["zone"],
+                        "Güven (%)": drone["confidence"],
+                        "X Ekseni": drone["x_coord"],
+                        "Y Ekseni": drone["y_coord"],
+                        "Sonuç": "Başarılı" if fire_event["success"] else "Başarısız"
+                    })
+            
+            df = pd.DataFrame(export_data)
+            
+            with pd.ExcelWriter(filename, engine='openpyxl') as writer:
+                df.to_excel(writer, sheet_name='Ateş Geçmişi', index=False)
+                worksheet = writer.sheets['Ateş Geçmişi']
+                column_widths = [20, 12, 12, 15, 12, 12, 12, 15]
+                for i, width in enumerate(column_widths, 1):
+                    worksheet.column_dimensions[chr(64+i)].width = width
+                for cell in worksheet[1]:
+                    cell.font = cell.font.copy(bold=True)
+                
+                for row in range(2, len(export_data) + 2):
+                    result_cell = worksheet.cell(row=row, column=8)
+                    if result_cell.value == "Başarılı":
+                        result_cell.font = result_cell.font.copy(color="00AA00")
+                    else:
+                        result_cell.font = result_cell.font.copy(color="AA0000")
+            
+            messagebox.showinfo("Başarılı", f"Ateş geçmişi başarıyla Excel dosyasına kaydedildi:\n{filename}")
+    except Exception as e:
+        messagebox.showerror("Hata", f"Excel dosyası kaydedilirken hata oluştu:\n{str(e)}")
+
+def export_fire_history_to_txt():
+    """Ateş geçmişini TXT dosyasına aktar"""
+    try:
+        if not fire_history:
+            messagebox.showwarning("Uyarı", "Dışa aktarılacak veri bulunmuyor!")
+            return
+            
+        filename = filedialog.asksaveasfilename(
+            defaultextension=".txt",
+            filetypes=[("Metin dosyası", "*.txt"), ("Tüm dosyalar", "*.*")],
+            initialfile=f"fire_history_{datetime.now().strftime('%Y-%m-%d %H:%M:%S.%f')[:-3]}.txt"
+        )
+        
+        if filename:
+            with open(filename, 'w', encoding='utf-8') as f:
+                f.write("DRONE ATEŞ GEÇMİŞİ\n")
+                f.write("="*80 + "\n")
+                f.write(f"Rapor Tarihi: {datetime.now().strftime('%Y-%m-%d %H:%M:%S.%f')[:-3]}\n")
+                f.write(f"Toplam Ateş: {len(fire_history)}\n\n")
+                
+                f.write(f"{'Tarih':<20} {'İstemci':<12} {'ID':<8} {'Bölge':<15} {'Güven':<8} {'X Eks':<8} {'Y Eks':<8} {'Sonuç':<12}\n")
+                f.write("-" * 95 + "\n")
+                
+                for fire_event in fire_history:
+                    for drone in fire_event["drones"]:
+                        result_text = "Başarılı" if fire_event["success"] else "Başarısız"
+                        drone_id_formatted = f"D{drone['id']:03d}"
+                        f.write(f"{fire_event['timestamp']:<20} ")
+                        f.write(f"{fire_event['client_id']:<12} ")
+                        f.write(f"{drone_id_formatted:<8} ")
+                        f.write(f"{drone['zone']:<15} ")
+                        f.write(f"{drone['confidence']:<8.1f} ")
+                        f.write(f"{drone['x_coord']:<8.2f} ")
+                        f.write(f"{drone['y_coord']:<8.2f} ")
+                        f.write(f"{result_text:<12}\n")
+            
+            messagebox.showinfo("Başarılı", f"Ateş geçmişi başarıyla TXT dosyasına kaydedildi:\n{filename}")
+    except Exception as e:
+        messagebox.showerror("Hata", f"TXT dosyası kaydedilirken hata oluştu:\n{str(e)}")
+
+def export_user_activity_to_excel():
+    """Kullanıcı aktivitelerini Excel dosyasına aktar"""
+    try:
+        if not user_activities:
+            messagebox.showwarning("Uyarı", "Dışa aktarılacak veri bulunmuyor!")
+            return
+            
+        filename = filedialog.asksaveasfilename(
+            defaultextension=".xlsx",
+            filetypes=[("Excel dosyası", "*.xlsx"), ("Tüm dosyalar", "*.*")],
+            initialfile=f"user_activity_{datetime.now().strftime('%Y-%m-%d %H:%M:%S.%f')[:-3]}.xlsx"
+        )
+        
+        if filename:
+            export_data = []
+            
+            for username, activity in user_activities.items():
+                user_info = users_db.get(username, {"name": "Bilinmeyen", "role": "Bilinmeyen"})
+                
+                login_times = activity["login_times"]
+                logout_times = activity["logout_times"]
+                
+                sessions = []
+                for i, login_time in enumerate(login_times):
+                    if i < len(logout_times):
+                        sessions.append((login_time, logout_times[i]))
+                    else:
+                        sessions.append((login_time, None))
+                
+                for login_time, logout_time in sessions:
+                    export_data.append({
+                        "Kullanıcı Adı": username,
+                        "Tam Adı": user_info["name"],
+                        "Rol": user_info["role"],
+                        "Giriş Zamanı": login_time,
+                        "Çıkış Zamanı": logout_time if logout_time else "Hala Aktif",
+                        "Oturum Süresi": calculate_duration(login_time, logout_time),
+                        "Ateş Sayısı": len([cmd for cmd in activity["fire_commands"] 
+                                           if logout_time is None or 
+                                           (login_time <= cmd["timestamp"] <= (logout_time if logout_time else datetime.now().strftime('%Y-%m-%d %H:%M:%S.%f')[:-3]))])
+                    })
+            
+            df = pd.DataFrame(export_data)
+            
+            with pd.ExcelWriter(filename, engine='openpyxl') as writer:
+                df.to_excel(writer, sheet_name='Kullanıcı Aktiviteleri', index=False)
+                worksheet = writer.sheets['Kullanıcı Aktiviteleri']
+                column_widths = [15, 20, 10, 20, 20, 15, 10]
+                for i, width in enumerate(column_widths, 1):
+                    worksheet.column_dimensions[chr(64+i)].width = width
+                for cell in worksheet[1]:
+                    cell.font = cell.font.copy(bold=True)
+            
+            messagebox.showinfo("Başarılı", f"Kullanıcı aktiviteleri başarıyla Excel dosyasına kaydedildi:\n{filename}")
+    except Exception as e:
+        messagebox.showerror("Hata", f"Excel dosyası kaydedilirken hata oluştu:\n{str(e)}")
+
+def calculate_duration(start_time_str, end_time_str):
+    """İki zaman damgası arasındaki süreyi hesapla"""
+    try:
+        start_time = datetime.strptime(start_time_str, '%Y-%m-%d %H:%M:%S.%f')
+        
+        if end_time_str is None:
+            end_time = datetime.now()
+        else:
+            end_time = datetime.strptime(end_time_str, '%Y-%m-%d %H:%M:%S.%f')
+        
+        duration = end_time - start_time
+        hours, remainder = divmod(duration.total_seconds(), 3600)
+        minutes, seconds = divmod(remainder, 60)
+        
+        return f"{int(hours)}s {int(minutes)}d {int(seconds)}s"
+    except:
+        return "Hesaplanamadı"
+
+# ===== SİSTEM FONKSİYONLARI =====
+def play_alert():
+    if not pygame.mixer.music.get_busy():
+        pygame.mixer.music.play()
+
+def start_server():
+    """TCP sunucusunu başlat"""
+    server_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    server_socket.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+    server_socket.bind((SERVER_HOST, SERVER_PORT))
+    server_socket.listen(5)
+    
+    print(f"Sunucu {SERVER_HOST}:{SERVER_PORT} adresinde başlatıldı...")
+    
+    def handle_client(client_socket, client_address):
+        """İstemci bağlantılarını yönet"""
+        print(f"Yeni bağlantı: {client_address}")
+        connected_clients.append(client_socket)
+        current_user = None
+        
+        try:
+            while True:
+                try:
+                    data = client_socket.recv(1024).decode('utf-8')
+                    if data:
+                        message = json.loads(data)
+                        
+                        # Giriş bilgisi kontrolü
+                        if message.get("type") == "login":
+                            username = message.get("username")
+                            password = message.get("password")
+                            
+                            if username in users_db and users_db[username]["password"] == password:
+                                current_user = {
+                                    "username": username,
+                                    "name": users_db[username]["name"],
+                                    "role": users_db[username]["role"],
+                                    "login_time": message.get("timestamp"),
+                                    "client_socket": client_socket
+                                }
+                                active_users[username] = current_user
+                                
+                                if username not in user_activities:
+                                    user_activities[username] = {
+                                        "login_times": [],
+                                        "logout_times": [],
+                                        "fire_commands": []
+                                    }
+                                
+                                user_activities[username]["login_times"].append(message.get("timestamp"))
+                                print(f"Kullanıcı giriş yaptı: {username} (Rol: {users_db[username]['role']})")
+                                
+                                # Client'a başarılı giriş yanıtı gönder
+                                response = {
+                                    "type": "login_response",
+                                    "success": True,
+                                    "message": "Giriş başarılı",
+                                    "user": {
+                                        "username": username,
+                                        "name": users_db[username]["name"],
+                                        "role": users_db[username]["role"]
+                                    }
+                                }
+                                client_socket.send((json.dumps(response) + "\n").encode('utf-8'))
+                            else:
+                                print(f"Geçersiz kullanıcı girişi denemesi: {username}")
+                                
+                                # Client'a başarısız giriş yanıtı gönder
+                                response = {
+                                    "type": "login_response",
+                                    "success": False,
+                                    "message": "Geçersiz kullanıcı adı veya şifre"
+                                }
+                                client_socket.send((json.dumps(response) + "\n").encode('utf-8'))
+                        
+                        # Çıkış bilgisi
+                        elif message.get("type") == "logout":
+                            username = message.get("username")
+                            if username in active_users:
+                                logout_time = message.get("timestamp")
+                                
+                                if username in user_activities:
+                                    user_activities[username]["logout_times"].append(logout_time)
+                                
+                                del active_users[username]
+                                print(f"Kullanıcı çıkış yaptı: {username}")
+                        
+                        # Ateş emri kontrolü
+                        elif message.get("command") == "FIRE":
+                            username = message.get("user", "unknown")
+                            print(f"ATEŞ EMRİ alındı - Kullanıcı: {username}, İstemci: {client_address}")
+                            
+                            # Kullanıcının ateş etme yetkisi var mı kontrol et
+                            fire_success = False
+                            if username in users_db:
+                                role = users_db[username]["role"]
+                                if role in ["admin", "yonetici", "operator"]:
+                                    fire_success = random.choice([True, False])
+                                else:
+                                    print(f"Kullanıcı {username} ateş etme yetkisine sahip değil: {role}")
+                            
+                            fire_entry = {
+                                "timestamp": datetime.now().strftime('%Y-%m-%d %H:%M:%S.%f')[:-3],
+                                "client_id": message.get("client_id", "unknown"),
+                                "user": username,
+                                "success": fire_success,
+                                "drones": []
+                            }
+                            
+                            if username in user_activities:
+                                user_activities[username]["fire_commands"].append({
+                                    "timestamp": fire_entry["timestamp"],
+                                    "success": fire_success
+                                })
+                            
+                            if current_drone_data.get("threat_level") == "YUKSEK TEHLİKE":
+                                for detection in current_drone_data.get("detections", []):
+                                    pos = detection.get("position", {})
+                                    
+                                    raw_map_x = pos.get("map_x", 0.5)
+                                    raw_map_y = pos.get("map_y", 0.5)
+                                    display_x = -((raw_map_x * 2) - 1)
+                                    display_y = -((raw_map_y * 2) - 1)
+                                    
+                                    drone_info = {
+                                        "id": detection.get("id", "?"),
+                                        "confidence": detection.get("confidence", 0),
+                                        "zone": pos.get("zone", get_direction_from_coordinates(display_x, display_y)),
+                                        "x_coord": display_x,
+                                        "y_coord": display_y
+                                    }
+                                    fire_entry["drones"].append(drone_info)
+                            
+                            fire_history.append(fire_entry)
+                            if len(fire_history) > max_fire_history:
+                                fire_history.pop(0)
+                            
+                            response = {
+                                "type": "fire_response",
+                                "success": fire_success,
+                                "message": "Ateş etme işlemi başarılı!" if fire_success else "Ateş etme işlemi başarısız!",
+                                "timestamp": fire_entry["timestamp"]
+                            }
+                            
+                            client_socket.send((json.dumps(response) + "\n").encode('utf-8'))
+                            
+                            window.after(0, update_fire_history_tree)
+                            window.after(0, update_user_activity_tree)
+                            
+                except socket.timeout:
+                    continue
+                except Exception as e:
+                    print(f"İstemci veri işleme hatası: {e}")
+                    break
+                    
+        except Exception as e:
+            print(f"İstemci hatası {client_address}: {e}")
+        finally:
+            if current_user and current_user["username"] in active_users:
+                username = current_user["username"]
+                logout_time = datetime.now().strftime('%Y-%m-%d %H:%M:%S.%f')[:-3]
+                
+                if username in user_activities:
+                    user_activities[username]["logout_times"].append(logout_time)
+                
+                del active_users[username]
+                print(f"Kullanıcı bağlantısı kesildi: {username}")
+            
+            if client_socket in connected_clients:
+                connected_clients.remove(client_socket)
+            client_socket.close()
+            print(f"Bağlantı kesildi: {client_address}")
+    
+    def accept_connections():
+        """Yeni bağlantıları kabul et"""
+        while True:
+            try:
+                client_socket, client_address = server_socket.accept()
+                client_socket.settimeout(1.0)
+                client_thread = threading.Thread(
+                    target=handle_client, 
+                    args=(client_socket, client_address)
+                )
+                client_thread.daemon = True
+                client_thread.start()
+            except Exception as e:
+                print(f"Sunucu hatası: {e}")
+                break
+    
+    accept_thread = threading.Thread(target=accept_connections)
+    accept_thread.daemon = True
+    accept_thread.start()
+
+def broadcast_drone_data():
+    """Drone verilerini tüm istemcilere gönder"""
+    if not connected_clients:
+        return
+    
+    message = json.dumps(current_drone_data) + "\n"
+    
+    for client in connected_clients[:]:
+        try:
+            client.send(message.encode('utf-8'))
+        except Exception as e:
+            print(f"İstemciye veri gönderme hatası: {e}")
+            if client in connected_clients:
+                connected_clients.remove(client)
+
+# ===== ARAYÜZ OLUŞTURMA =====
+window = tk.Tk()
+window.title("Drone Tespit Server - Raporlar")
+window.geometry("1400x900")
+
+# Ana çerçeve
+main_frame = tk.Frame(window)
+main_frame.pack(fill=tk.BOTH, expand=True, padx=10, pady=10)
+
+# Üst kısım - Sistem Durumu
+status_frame = tk.LabelFrame(main_frame, text="Sistem Durumu", font=("Arial", 14, "bold"), height=120)
+status_frame.pack(fill=tk.X, pady=(0, 10))
+status_frame.pack_propagate(False)
+
+# Durum bilgileri için grid layout
+status_grid = tk.Frame(status_frame)
+status_grid.pack(fill=tk.BOTH, expand=True, padx=10, pady=10)
+
+# Sol kolon - Server bilgileri
+left_status = tk.Frame(status_grid)
+left_status.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+
+server_label = tk.Label(left_status, text=f"Server: {SERVER_HOST}:{SERVER_PORT}", 
+                       font=("Arial", 11, "bold"), fg="blue")
+server_label.pack(anchor="w")
+
+client_count_label = tk.Label(left_status, text="Bağlı İstemci: 0", font=("Arial", 11))
+client_count_label.pack(anchor="w")
+
+system_time_label = tk.Label(left_status, text="", font=("Arial", 11))
+system_time_label.pack(anchor="w")
+
+# Orta kolon - Tespit durumu
+middle_status = tk.Frame(status_grid)
+middle_status.pack(side=tk.LEFT, fill=tk.BOTH, expand=True, padx=20)
+
+threat_level_label = tk.Label(middle_status, text="Tehlike Seviyesi: YOK", 
+                             font=("Arial", 12, "bold"), fg="green")
+threat_level_label.pack(anchor="w")
+
+active_drones_label = tk.Label(middle_status, text="Aktif Drone: 0", font=("Arial", 11))
+active_drones_label.pack(anchor="w")
+
+last_detection_label = tk.Label(middle_status, text="Son Tespit: -", font=("Arial", 11))
+last_detection_label.pack(anchor="w")
+
+# Sağ kolon - Sistem kontrolleri
+right_status = tk.Frame(status_grid)
+right_status.pack(side=tk.RIGHT, fill=tk.BOTH, expand=True)
+
+camera_status_label = tk.Label(right_status, text="Kamera: Aktif", 
+                              font=("Arial", 11), fg="green")
+camera_status_label.pack(anchor="w")
+
+ai_model_label = tk.Label(right_status, text="AI Model: Yüklü", 
+                         font=("Arial", 11), fg="green")
+ai_model_label.pack(anchor="w")
+
+alert_system_label = tk.Label(right_status, text="Alarm Sistemi: Hazır", 
+                             font=("Arial", 11), fg="green")
+alert_system_label.pack(anchor="w")
+
+# Ana içerik alanı - Notebook için
+content_frame = tk.Frame(main_frame)
+content_frame.pack(fill=tk.BOTH, expand=True)
+
+# Notebook (sekmeli arayüz)
+notebook = ttk.Notebook(content_frame)
+notebook.pack(fill=tk.BOTH, expand=True)
+
+# Sekme 1: Anlık Tespitler
+current_frame = tk.Frame(notebook)
+notebook.add(current_frame, text="Anlık Tespitler")
+
+current_tree_frame = tk.Frame(current_frame)
+current_tree_frame.pack(fill=tk.BOTH, expand=True, padx=10, pady=10)
+
+current_tree_scroll = tk.Scrollbar(current_tree_frame)
+current_tree_scroll.pack(side=tk.RIGHT, fill=tk.Y)
+
+current_tree = ttk.Treeview(current_tree_frame, 
+                           columns=("ID", "Tehlike Seviyesi", "Güven", "Bölge", "X Ekseni", "Y Ekseni"),
+                           show="headings",
+                           yscrollcommand=current_tree_scroll.set)
+
+current_tree_scroll.config(command=current_tree.yview)
+
+columns_config = [
+    ("ID", 80),
+    ("Tehlike Seviyesi", 120),
+    ("Güven", 100),
+    ("Bölge", 120),
+    ("X Ekseni", 100),
+    ("Y Ekseni", 100)
+]
+
+for col, width in columns_config:
+    current_tree.heading(col, text=col)
+    current_tree.column(col, width=width, anchor="center")
+
+current_tree.pack(fill=tk.BOTH, expand=True)
+
+# Sekme 2: Tespit Geçmişi
+history_frame = tk.Frame(notebook)
+notebook.add(history_frame, text="Tespit Geçmişi")
+
+history_controls = tk.Frame(history_frame)
+history_controls.pack(fill=tk.X, padx=10, pady=5)
+
+clear_history_btn = tk.Button(history_controls, text="Geçmişi Temizle", 
+                             command=clear_detection_history)
+clear_history_btn.pack(side=tk.LEFT)
+
+export_excel_btn = tk.Button(history_controls, text="Excel'e Aktar", 
+                            command=export_to_excel)
+export_excel_btn.pack(side=tk.LEFT, padx=(10, 0))
+
+export_txt_btn = tk.Button(history_controls, text="TXT'ye Aktar", 
+                          command=export_to_txt)
+export_txt_btn.pack(side=tk.LEFT, padx=(10, 0))
+
+history_tree_frame = tk.Frame(history_frame)
+history_tree_frame.pack(fill=tk.BOTH, expand=True, padx=10, pady=10)
+
+history_tree_scroll = tk.Scrollbar(history_tree_frame)
+history_tree_scroll.pack(side=tk.RIGHT, fill=tk.Y)
+
+history_tree = ttk.Treeview(history_tree_frame,
+                           columns=("Tespit Saati", "ID", "Güven", "Bölge", "Tehlike Seviyesi", "X Ekseni", "Y Ekseni"),
+                           show="headings",
+                           yscrollcommand=history_tree_scroll.set)
+
+history_tree_scroll.config(command=history_tree.yview)
+
+history_columns_config = [
+    ("Tespit Saati", 180),
+    ("ID", 60),
+    ("Güven", 80),
+    ("Bölge", 120),
+    ("Tehlike Seviyesi", 120),
+    ("X Ekseni", 70),
+    ("Y Ekseni", 70)
+]
+
+for col, width in history_columns_config:
+    history_tree.heading(col, text=col)
+    history_tree.column(col, width=width, anchor="center")
+
+history_tree.pack(fill=tk.BOTH, expand=True)
+
+# Sekme 3: İstatistikler
+stats_frame = tk.Frame(notebook)
+notebook.add(stats_frame, text="İstatistikler")
+
+stats_grid = tk.Frame(stats_frame)
+stats_grid.pack(fill=tk.BOTH, expand=True, padx=20, pady=20)
+
+stat_cards = []
+stat_texts = ["Toplam Tespit", "Yüksek Tehlike", "Orta Seviye", "Düşük Tehlike", 
+              "Ortalama Güven", "Aktif Süre"]
+
+for i in range(6):
+    card_frame = tk.LabelFrame(stats_grid, text=stat_texts[i], font=("Arial", 12, "bold"))
+    card_frame.grid(row=i//3, column=i%3, padx=10, pady=10, sticky="nsew", ipadx=20, ipady=20)
+    
+    value_label = tk.Label(card_frame, text="0", font=("Arial", 24, "bold"), fg="blue")
+    value_label.pack()
+    
+    stat_cards.append(value_label)
+
+for i in range(2):
+    stats_grid.grid_rowconfigure(i, weight=1)
+for i in range(3):
+    stats_grid.grid_columnconfigure(i, weight=1)
+
+# Sekme 4: Ateş Geçmişi
+fire_history_frame = tk.Frame(notebook)
+notebook.add(fire_history_frame, text="Ateş Geçmişi")
+
+fire_history_controls = tk.Frame(fire_history_frame)
+fire_history_controls.pack(fill=tk.X, padx=10, pady=5)
+
+clear_fire_history_btn = tk.Button(fire_history_controls, text="Geçmişi Temizle", 
+                                   command=clear_fire_history)
+clear_fire_history_btn.pack(side=tk.LEFT)
+
+export_fire_history_excel_btn = tk.Button(fire_history_controls, text="Excel'e Aktar", 
+                                         command=export_fire_history_to_excel)
+export_fire_history_excel_btn.pack(side=tk.LEFT, padx=(10, 0))
+
+export_fire_history_txt_btn = tk.Button(fire_history_controls, text="TXT'ye Aktar", 
+                                       command=export_fire_history_to_txt)
+export_fire_history_txt_btn.pack(side=tk.LEFT, padx=(10, 0))
+
+fire_history_tree_frame = tk.Frame(fire_history_frame)
+fire_history_tree_frame.pack(fill=tk.BOTH, expand=True, padx=10, pady=10)
+
+fire_history_tree_scroll = tk.Scrollbar(fire_history_tree_frame)
+fire_history_tree_scroll.pack(side=tk.RIGHT, fill=tk.Y)
+
+fire_history_tree = ttk.Treeview(fire_history_tree_frame,
+                               columns=("Tarih", "İstemci", "Drone ID", "Bölge", "Güven", "X Ekseni", "Y Ekseni", "Sonuç"),
+                               show="headings",
+                               yscrollcommand=fire_history_tree_scroll.set)
+
+fire_history_tree_scroll.config(command=fire_history_tree.yview)
+
+fire_history_columns_config = [
+    ("Tarih", 180),
+    ("İstemci", 100),
+    ("Drone ID", 80),
+    ("Bölge", 120),
+    ("Güven", 80),
+    ("X Ekseni", 70),
+    ("Y Ekseni", 70),
+    ("Sonuç", 100)
+]
+
+for col, width in fire_history_columns_config:
+    fire_history_tree.heading(col, text=col)
+    fire_history_tree.column(col, width=width, anchor="center")
+
+fire_history_tree.pack(fill=tk.BOTH, expand=True)
+
+# Sekme 5: Kullanıcı Aktiviteleri
+user_activity_frame = tk.Frame(notebook)
+notebook.add(user_activity_frame, text="Kullanıcı Aktiviteleri")
+
+user_activity_controls = tk.Frame(user_activity_frame)
+user_activity_controls.pack(fill=tk.X, padx=10, pady=5)
+
+refresh_user_activity_btn = tk.Button(user_activity_controls, text="Yenile", 
+                                     command=update_user_activity_tree)
+refresh_user_activity_btn.pack(side=tk.LEFT)
+
+export_user_activity_btn = tk.Button(user_activity_controls, text="Excel'e Aktar", 
+                                    command=export_user_activity_to_excel)
+export_user_activity_btn.pack(side=tk.LEFT, padx=(10, 0))
+
+user_activity_tree_frame = tk.Frame(user_activity_frame)
+user_activity_tree_frame.pack(fill=tk.BOTH, expand=True, padx=10, pady=10)
+
+user_activity_tree_scroll = tk.Scrollbar(user_activity_tree_frame)
+user_activity_tree_scroll.pack(side=tk.RIGHT, fill=tk.Y)
+
+user_activity_tree = ttk.Treeview(user_activity_tree_frame,
+                                 columns=("Kullanıcı Adı", "Tam Adı", "Rol", "Durum", "Oturum Süresi", "Son Aktivite", "Ateş Sayısı"),
+                                 show="headings",
+                                 yscrollcommand=user_activity_tree_scroll.set)
+
+user_activity_tree_scroll.config(command=user_activity_tree.yview)
+
+user_activity_columns_config = [
+    ("Kullanıcı Adı", 120),
+    ("Tam Adı", 150),
+    ("Rol", 100),
+    ("Durum", 100),
+    ("Oturum Süresi", 120),
+    ("Son Aktivite", 150),
+    ("Ateş Sayısı", 100)
+]
+
+for col, width in user_activity_columns_config:
+    user_activity_tree.heading(col, text=col)
+    user_activity_tree.column(col, width=width, anchor="center")
+
+user_activity_tree.pack(fill=tk.BOTH, expand=True)
+
+# ===== KAMERA VE TESPİT SİSTEMİ =====
+cap = cv2.VideoCapture(0)
+
+def background_detection():
+    """Arka planda drone tespiti yap"""
+    global current_drone_data, detection_history
+    
+    ret, frame = cap.read()
+    if not ret:
+        return
+
+    if model is None:
+        return
+
+    results = model(frame)
+    
+    threat_level = "YOK"
+    alert_triggered = False
+    detections = []
+    
+    frame_height, frame_width = frame.shape[:2]
+
+    for i, result in enumerate(results):
+        for j, box in enumerate(result.boxes):
+            cls_id = int(box.cls[0].item())
+            cls_name = model.names[cls_id]
+
+            if cls_name.lower() != "drone":
+                continue
+
+            x1, y1, x2, y2 = box.xyxy[0].cpu().numpy()
+            width = x2 - x1
+            height = y2 - y1
+            area = width * height
+            confidence = box.conf[0].item() * 100
+
+            center_x = int((x1 + x2) / 2)
+            center_y = int((y1 + y2) / 2)
+            
+            map_x = center_x / frame_width
+            map_y = center_y / frame_height
+            
+            display_x = -((map_x * 2) - 1)
+            display_y = -((map_y * 2) - 1)
+            
+            zone_name = get_direction_from_coordinates(display_x, display_y)
+            
+            current_threat = "YOK"
+            distance_info = "Uzak"
+            
+            if area > 40000:
+                current_threat = "YUKSEK TEHLİKE"
+                distance_info = "Çok Yakın"
+                alert_triggered = True
+            elif area > 20000:
+                current_threat = "ORTA SEVİYE"
+                distance_info = "Yakın"
+            elif area > 5000:
+                current_threat = "DUSUK"
+                distance_info = "Orta"
+            else:
+                current_threat = "DUSUK"
+                distance_info = "Uzak"
+            
+            if current_threat == "YUKSEK TEHLİKE":
+                threat_level = "YUKSEK TEHLİKE"
+            elif current_threat == "ORTA SEVİYE" and threat_level != "YUKSEK TEHLİKE":
+                threat_level = "ORTA SEVİYE"
+            elif current_threat == "DUSUK" and threat_level == "YOK":
+                threat_level = "DUSUK"
+            
+            detections.append({
+                "id": len(detections) + 1,
+                "confidence": confidence,
+                "position": {
+                    "map_x": map_x,
+                    "map_y": map_y,
+                    "zone": zone_name,
+                    "distance": distance_info
+                }
+            })
+    
+    current_drone_data = {
+        "drone_count": len(detections),
+        "threat_level": threat_level,
+        "detections": detections,
+        "timestamp": datetime.now().strftime('%Y-%m-%d %H:%M:%S.%f')[:-3],
+        "fire_authorized": threat_level == "YUKSEK TEHLİKE"
+    }
+    
+    if detections:
+        for detection in detections:
+            pos = detection["position"]
+            
+            raw_map_x = pos.get("map_x", 0.5)
+            raw_map_y = pos.get("map_y", 0.5)
+            display_x = -((raw_map_x * 2) - 1)
+            display_y = -((raw_map_y * 2) - 1)
+            
+            zone_name = pos.get("zone", get_direction_from_coordinates(display_x, display_y))
+            
+            history_entry = {
+                "timestamp": current_drone_data["timestamp"],
+                "id": f"D{detection['id']:03d}",
+                "confidence": detection['confidence'],
+                "zone": zone_name,
+                "threat_level": threat_level,
+                "display_x": display_x,
+                "display_y": display_y
+            }
+            detection_history.append(history_entry)
+        
+        if len(detection_history) > max_history:
+            detection_history = detection_history[-max_history:]
+    
+    if alert_triggered:
+        play_alert()
+    
+    window.after(0, update_current_tree)
+    window.after(0, update_history_tree)
+    window.after(0, update_statistics)
+    window.after(0, lambda: threat_level_label.config(
+        text=f"Tehlike Seviyesi: {threat_level}",
+        fg="red" if threat_level == "YUKSEK TEHLİKE" else "orange" if threat_level == "ORTA SEVİYE" else "green"
+    ))
+    window.after(0, lambda: active_drones_label.config(text=f"Aktif Drone: {len(detections)}"))
+    window.after(0, lambda: last_detection_label.config(
+        text=f"Son Tespit: {current_drone_data['timestamp']}"
+    ))
+    
+    broadcast_drone_data()
+
+# ===== SİSTEMİ BAŞLATMA =====
+def update_system_time():
+    """Sistem zamanını güncelle"""
+    system_time_label.config(text=f"Sistem Zamanı: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
+    window.after(1000, update_system_time)
+
+def update_client_count():
+    """Bağlı istemci sayısını güncelle"""
+    client_count_label.config(text=f"Bağlı İstemci: {len(connected_clients)}")
+    window.after(1000, update_client_count)
+
+# Sunucuyu başlat
+start_server()
+
+# Arka plan tespiti başlat
+def detection_loop():
+    background_detection()
+    window.after(100, detection_loop)
+
+# Sistem güncellemelerini başlat
+update_system_time()
+update_client_count()
+detection_loop()
+
+# Arayüzü göster
+window.mainloop()
+
+# Kaynakları serbest bırak
+cap.release()
+cv2.destroyAllWindows()
